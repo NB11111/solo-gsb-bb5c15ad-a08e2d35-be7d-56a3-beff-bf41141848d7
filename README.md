@@ -4,7 +4,7 @@
 
 - 技术栈：Python 3.11 + FastAPI + SQLite + 原生 HTML/CSS/JS（无前端构建、无第三方账号）
 - 页面与 API 统一暴露在 **8000** 端口
-- 核心能力：以有向图递归计算替代链带来的过敏原影响、检测循环并标记每条受影响路径、**勾选需避开的过敏原后组合整方"安全替代方案"**、**选定一组方案后由后端重新校验并生成可下载（JSON/CSV）的合并采购清单**、两版配方差异对比、**同一配方代码跨全部版本的"过敏原回归矩阵"（逐版复用替代图分析，输出新增/消失过敏原、受影响配料、首次出现版本与循环/缺失标记）**、**配方变更审计（同事务不可变事件 + 时间线查询 + 可读配料差异）**、原料/配方 JSON 导入导出
+- 核心能力：以有向图递归计算替代链带来的过敏原影响、检测循环并标记每条受影响路径、**勾选需避开的过敏原后组合整方"安全替代方案"**、**选定一组方案后由后端重新校验并生成可下载（JSON/CSV）的合并采购清单**、两版配方差异对比、**同一配方代码跨全部版本的"过敏原回归矩阵"（逐版复用替代图分析，输出新增/消失过敏原、受影响配料、首次出现版本与循环/缺失标记）**、**配方变更审计（同事务不可变事件 + 时间线查询 + 可读配料差异）**、**配方版本发布锁（草稿 → 发布校验 → 已发布只读锁定 → 可撤回）**、原料/配方 JSON 导入导出
 
 ---
 
@@ -43,6 +43,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ### 启动说明与自检
 
 - 首次启动时 `init_db()` 会自动建表（含 `recipe_audit_events` 审计表及禁止 UPDATE/DELETE 的触发器），**无需手动迁移**；旧版本已有的 `data/app.db` 也会通过 `CREATE TABLE/TRIGGER IF NOT EXISTS` 平滑升级，已有数据不受影响。
+- 发布锁版本升级时，旧库会自动补齐 `recipes.status`（`draft`/`published`，历史版本默认草稿）与 `recipes.published_at` 两列，并把审计表的 `action` 约束扩展为可容纳 `published`/`unpublished`（按 SQLite 官方流程重建审计表，历史事件原样保留、不可变触发器随后重建）；全过程幂等，仅在检测到缺少 `status` 列时执行一次。
 - 审计时间为 UTC（与配方 `created_at` 一致，使用 SQLite `datetime('now')`）。
 - 启动后可这样快速自检：
 
@@ -87,6 +88,10 @@ curl -s "http://localhost:8000/api/audit/events?limit=5" # 查看最近审计事
    - 每次创建 / 修改 / 删除配方都会记录一条不可变事件（与配方操作在**同一数据库事务**中提交，操作失败一起回滚）
    - 事件包含操作时间（UTC）、配方 id / 代码 / 版本、前后完整配料快照，以及按配料增删、用量变化、单位变化生成的中文可读差异
    - 可按「全部配方 / 某配方代码的全部版本 / 单个配方 id」与时间范围过滤；展开任一事件可对比前后快照明细表。
+7. 在「**配方版本**」页体验**发布锁**：
+   - 每个版本初始为 `📝 草稿`，行内点击「🔒 发布」即调用 `POST /api/recipes/{id}/publish`；示例数据 `COOKIE-001` 各版本含 `BUTTER ↔ MARGARINE` 循环，发布会被拒绝，顶部红色区块给出**循环/缺失节点的具体路径证据**
+   - 发布成功后状态变为 `🔒 已发布`，该版本的**配方内容、其引用链路上的原料过敏原/代码、相关替代边**写接口全部返回 `409` 并在错误体中指出锁定版本与影响路径；只有「撤回发布」可解除
+   - 点击「撤回发布」调用 `/unpublish` 后版本回到草稿，可继续编辑；发布/撤回同样写入不可变审计事件。
 
 ---
 
@@ -144,13 +149,55 @@ curl -s "http://localhost:8000/api/audit/events?limit=5" # 查看最近审计事
 - 差异在查询时根据两份快照即时计算（`app/audit.py` 的 `diff_snapshots`）：配料**新增 / 删除**、**用量变化**、**单位变化**（或用量与单位同时变化）以及配方名称 / 备注 / 版本号 / 代码等元数据变化，各自输出中文可读行；结构化的 `added` / `removed` / `changed` 字段同时返回，供前端排版。
 - 时间线支持按配方 id、配方代码（代码被修改后按新代码查询；历史事件保留事件发生时的代码）和 `start` / `end` 时间范围（ISO 8601，如 `2026-09-01` 或 `2026-09-01T08:00:00`，按 UTC 比较）过滤，按时间倒序、最多返回 `limit`（1~500，默认 100）条。
 
+### 配方版本发布锁
+
+- 版本有两种状态：`draft`（草稿，初始值）与 `published`（已发布）。状态与发布时间 `published_at`（UTC）随 `GET /api/recipes` 与 `GET /api/recipes/{id}` 一并返回。
+- **发布** `POST /api/recipes/{id}/publish`：后端在**请求的同一事务内**按当前数据重新执行替代图分析（与「过敏原分析」页完全相同的 DFS）：
+  - 存在**循环路径**或**缺失原料节点**时拒绝发布，返回 `422`，`detail.cycles`（每条循环的根配料、成环节点、完整节点序列、路径编号）与 `detail.missing`（缺失节点代码、出现路径）给出可直接定位的证据；状态翻转与审计事件均不写入（同事务回滚，版本仍是草稿）。
+  - 校验通过后置为 `published`、写入 `published_at` 并追加一条 `published` 审计事件；重复发布返回 `409`。
+- **撤回** `POST /api/recipes/{id}/unpublish`：恢复为草稿、清空 `published_at` 并追加 `unpublished` 审计事件；对草稿调用返回 `409`。
+- **锁定范围（写保护）**：已发布期间，以下修改返回 `409`，错误体 `detail.locked_versions` 逐条列出锁定版本（id/代码/版本/发布时间）及该对象**经由哪条替代路径进入该版本**（`via_path`，配料自身为 `via_direct=true`）：
+  - 配方版本自身：`PUT /api/recipes/{id}`（含配料表整体替换）、`DELETE /api/recipes/{id}`；
+  - 原料：`PUT /api/ingredients/{code}` 中改动**代码**（节点身份）或**过敏原集合**（分析结果）会被拒绝；仅改名称/备注不影响分析，仍允许；`DELETE` 一个被锁定版本引用链路覆盖的原料会被拒绝；
+  - 替代关系：新增（源在锁定版本闭包内）、删除、修改（旧边任一端点或新边源在闭包内）均被拒绝；
+  - `POST /api/import`（merge / replace）同样经过上述校验，触及已发布版本时整个导入事务回滚并返回 `409`。
+- 影响判定取「从版本配料出发、忽略边方向」的原料闭包（宁可多提示，不漏掉真实影响），证据路径则给出一条**最短同向路径**。除应用层强制外，`recipes` / `recipe_items` 上还有数据库触发器兜底，直接执行 SQL 改写已发布版本也会被 `RAISE(ABORT)` 拒绝（发布/撤回只改 `status`/`published_at`，可正常通过）。
+
+```bash
+# 发布（成功）
+curl -s -X POST http://localhost:8000/api/recipes/4/publish
+# {"id":4,"code":"TEST-1","version":"1.0","status":"published","published_at":"2026-09-22 21:47:51",
+#  "validation":{"direct_allergens":[],"total_allergens":[],"cycles":0,"missing_nodes":[]}}
+
+# 发布被拒：存在循环（422，detail 内为路径证据）
+curl -s -X POST http://localhost:8000/api/recipes/1/publish
+# {"detail":{"message":"替代图分析未通过（1 条循环替代路径），发布已拒绝；…",
+#   "recipe":{...},
+#   "cycles":[{"path_id":3,"root":"BUTTER","cycle_node":"BUTTER","nodes":["BUTTER","MARGARINE","BUTTER"]}],
+#   "missing":[]}}
+
+# 已发布后改原料过敏原被拒（409，指出锁定版本与影响路径）
+curl -s -X PUT http://localhost:8000/api/ingredients/RICE_FLOUR \
+  -H 'Content-Type: application/json' \
+  -d '{"code":"RICE_FLOUR","name":"米粉","allergens":"芝麻"}'
+# {"detail":{"message":"修改原料 RICE_FLOUR 的过敏原 会影响已发布锁定的配方版本：TEST-1 v1.0（id=4）。…",
+#   "locked_versions":[{"id":4,"code":"TEST-1","version":"1.0","status":"published",
+#     "via_code":"RICE_FLOUR","via_direct":true,"via_path":["RICE_FLOUR"],"reason":"ingredient_allergens",...}]}}
+
+# 撤回发布后即可继续修改
+curl -s -X POST http://localhost:8000/api/recipes/4/unpublish
+# {"id":4,"code":"TEST-1","version":"1.0","status":"draft","published_at":null}
+```
+
 ## 主要 API
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET/POST | `/api/ingredients`，PUT/DELETE `/api/ingredients/{code}` | 原料 CRUD |
-| GET/POST | `/api/substitutions`，PUT/DELETE `/api/substitutions/{id}` | 替代关系 CRUD |
-| GET/POST | `/api/recipes`，PUT/DELETE `/api/recipes/{id}` | 配方版本 CRUD（含配料表整体替换） |
+| GET/POST | `/api/ingredients`，PUT/DELETE `/api/ingredients/{code}` | 原料 CRUD；改动被已发布版本引用链路上原料的代码/过敏原、或删除该原料，返回 409（改名/备注允许） |
+| GET/POST | `/api/substitutions`，PUT/DELETE `/api/substitutions/{id}` | 替代关系 CRUD；增删改影响已发布版本替代图的边返回 409（`detail.locked_versions` 指出锁定版本与路径） |
+| GET/POST | `/api/recipes`，PUT/DELETE `/api/recipes/{id}` | 配方版本 CRUD（含配料表整体替换）；已发布版本的 PUT/DELETE 返回 409 |
+| POST | `/api/recipes/{id}/publish` | 发布版本：同事务重新执行替代图分析，有循环/缺失节点返回 422 并在 `detail.cycles`/`detail.missing` 给出路径证据；通过后置为已发布；重复发布 409 |
+| POST | `/api/recipes/{id}/unpublish` | 撤回发布：版本回到草稿，解除写锁定；对草稿调用 409 |
 | GET | `/api/recipes/{id}/analyze` | 替代链过敏原递归分析 + 循环检测 |
 | POST | `/api/recipes/{id}/safe-plans` | 安全替代方案，body：`{"avoid_allergens": ["乳", "小麦（麸质）"]}`（可空）；返回按替换项数/路径总长度排序的最多 50 组方案，无解时给出阻塞配料 |
 | POST | `/api/recipes/{id}/confirm-plan` | 确认一组方案：后端重新校验所选终点仍避开过敏原，通过后返回按终点合并的采购清单；body：`{"avoid_allergens":[...], "selections":[{"ingredient_code","selected_code","path_codes":[...]}]}`；校验失败返回 422，`detail.failures` 逐行给出原因 |
@@ -159,7 +206,7 @@ curl -s "http://localhost:8000/api/audit/events?limit=5" # 查看最近审计事
 | GET | `/api/audit/events` | 配方变更审计时间线；query：`recipe_id` / `recipe_code` / `start` / `end`（ISO 8601，UTC）/ `limit`（默认 100，1~500）；返回事件及前后快照、结构化与可读差异 |
 | GET | `/api/recipes/{id}/audit` | 单个配方的变更审计时间线（参数同上；配方不存在返回 404，已删除配方可用 `/api/audit/events?recipe_code=` 追溯） |
 | GET | `/api/export` | 导出全部数据 JSON |
-| POST | `/api/import?mode=merge\|replace` | 导入 JSON；merge 按主键 upsert，replace 清空后导入 |
+| POST | `/api/import?mode=merge\|replace` | 导入 JSON；merge 按主键 upsert，replace 清空后导入；触及已发布版本锁定时整体回滚并返回 409 |
 | POST | `/api/seed` | 载入内置示例数据（幂等） |
 
 ### 导入/导出 JSON 格式
@@ -195,10 +242,11 @@ curl -s "http://localhost:8000/api/audit/events?limit=5" # 查看最近审计事
 │   ├── graph.py       # 有向图 DFS：替代链过敏原传播 / 循环检测 / 路径标记（支持图一次构建、跨版本复用）
 │   ├── regression.py  # 过敏原回归矩阵：版本稳定排序 + 逐版图分析复用 + 相邻版本差异/首见版本/循环缺失标记
 │   ├── safe_plans.py  # 安全替代方案：候选剪枝枚举 + 最佳优先整方组合（≤50 组）
-│   ├── crud.py        # 原料 / 配方 / 替代关系数据操作（配方写操作同事务追加审计事件）
-│   ├── audit.py       # 配方变更审计：快照 / 不可变事件写入 / 时间线查询 / 可读差异
+│   ├── crud.py        # 原料 / 配方 / 替代关系数据操作（配方写操作同事务追加审计事件；已发布版本写保护在此层强制）
+│   ├── publishing.py  # 发布锁：发布前循环/缺失证据、已发布版本闭包影响判定与 409 锁定错误
+│   ├── audit.py       # 配方变更审计：快照 / 不可变事件写入（含发布/撤回）/ 时间线查询 / 可读差异
 │   ├── schemas.py     # Pydantic 模型与过敏原规范化
-│   ├── database.py    # SQLite 连接、建表与审计表不可变触发器
+│   ├── database.py    # SQLite 连接、建表/旧库迁移与审计表不可变触发器、已发布版本锁定触发器
 │   └── seed.py        # 内置示例数据
 ├── static/
 │   ├── index.html     # 单页界面（7 个标签页）

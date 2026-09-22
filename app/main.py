@@ -4,12 +4,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Request, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
-from . import audit, crud, graph, regression, safe_plans, seed
+from . import audit, crud, graph, publishing, regression, safe_plans, seed
 from .database import get_connection, init_db
 from .schemas import (
     ConfirmPlanIn,
@@ -19,7 +19,6 @@ from .schemas import (
     RecipeIn,
     SafePlanIn,
     SubstitutionIn,
-    normalize_allergens,
 )
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -33,6 +32,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="配方替代过敏原追踪", version="1.0.0", lifespan=lifespan)
+
+
+@app.exception_handler(publishing.PublishedLockError)
+async def published_lock_handler(request: Request, exc: publishing.PublishedLockError):
+    """已发布版本锁定：统一 409 + 结构化 detail（锁定版本与影响路径证据）。"""
+    return JSONResponse(status_code=409, content={"detail": exc.detail})
 
 
 # ---------------- 序列化辅助 ----------------
@@ -64,6 +69,8 @@ def _recipe_out(conn, row):
         "name": row["name"],
         "note": row["note"],
         "created_at": row["created_at"],
+        "status": row["status"],
+        "published_at": row["published_at"],
         "items": [dict(it) for it in items],
     }
 
@@ -129,8 +136,9 @@ def update_ingredient(code: str, data: IngredientIn, conn=Depends(conn_dep)):
 
 @app.delete("/api/ingredients/{code}")
 def remove_ingredient(code: str, conn=Depends(conn_dep)):
-    if not crud.delete_ingredient(conn, code):
+    if not crud.get_ingredient(conn, code):
         raise HTTPException(404, f"原料 {code} 不存在")
+    crud.delete_ingredient(conn, code)
     # 清理悬挂的替代边
     conn.execute("DELETE FROM substitutions WHERE source_code = ? OR target_code = ?", (code, code))
     return {"deleted": code}
@@ -153,6 +161,8 @@ def create_substitution(data: SubstitutionIn, conn=Depends(conn_dep)):
         raise HTTPException(404, f"目标原料 {data.target_code} 不存在")
     try:
         sid = crud.create_substitution(conn, data)
+    except publishing.PublishedLockError:
+        raise  # 命中发布锁：交由全局处理器返回 409
     except Exception:
         raise HTTPException(409, "该替代关系已存在")
     row = conn.execute(
@@ -169,7 +179,8 @@ def create_substitution(data: SubstitutionIn, conn=Depends(conn_dep)):
 
 @app.put("/api/substitutions/{sub_id}")
 def update_substitution(sub_id: int, data: SubstitutionIn, conn=Depends(conn_dep)):
-    if crud.get_substitution(conn, sub_id) is None:
+    existing = crud.get_substitution(conn, sub_id)
+    if existing is None:
         raise HTTPException(404, "替代关系不存在")
     if data.source_code == data.target_code:
         raise HTTPException(422, "替代源与目标不能是同一原料")
@@ -179,6 +190,8 @@ def update_substitution(sub_id: int, data: SubstitutionIn, conn=Depends(conn_dep
         raise HTTPException(404, f"目标原料 {data.target_code} 不存在")
     try:
         crud.update_substitution(conn, sub_id, data)
+    except publishing.PublishedLockError:
+        raise  # 命中发布锁：交由全局处理器返回 409
     except Exception:
         raise HTTPException(409, "已存在相同的替代边")
     row = conn.execute(
@@ -213,6 +226,8 @@ def get_recipes(conn=Depends(conn_dep)):
             "name": r["name"],
             "note": r["note"],
             "created_at": r["created_at"],
+            "status": r["status"],
+            "published_at": r["published_at"],
             "item_count": r["item_count"],
         }
         for r in rows
@@ -253,6 +268,72 @@ def remove_recipe(recipe_id: int, conn=Depends(conn_dep)):
     if not crud.delete_recipe(conn, recipe_id):
         raise HTTPException(404, "配方不存在")
     return {"deleted": recipe_id}
+
+
+# ---------------- 发布 / 撤回（发布锁） ----------------
+
+def _publish_status_out(conn, recipe_id: int):
+    row = crud.get_recipe(conn, recipe_id)
+    return {
+        "id": row["id"],
+        "code": row["code"],
+        "version": row["version"],
+        "name": row["name"],
+        "status": row["status"],
+        "published_at": row["published_at"],
+    }
+
+
+@app.post("/api/recipes/{recipe_id}/publish")
+def publish_recipe(recipe_id: int, conn=Depends(conn_dep)):
+    """发布配方版本。
+
+    在请求的同一事务内按当前数据重新执行替代图分析：存在循环路径或缺失
+    原料节点时拒绝发布（422，detail.cycles/detail.missing 给出对应路径证据），
+    通过后才把版本置为 published 并写审计事件；任一步失败整体回滚。
+    """
+    row = crud.get_recipe(conn, recipe_id)
+    if row is None:
+        raise HTTPException(404, "配方不存在")
+    if row["status"] == publishing.STATUS_PUBLISHED:
+        raise HTTPException(409, f"配方 {row['code']} 版本 {row['version']} 已处于发布状态")
+
+    # 同事务重新执行替代图分析（复用与分析页/回归矩阵完全一致的 DFS）
+    analysis = graph.analyze_recipe(conn, recipe_id)
+    evidence = publishing.build_publish_evidence(analysis)
+    if evidence is not None:
+        raise HTTPException(
+            422,
+            {
+                "message": evidence["message"],
+                "recipe": _publish_status_out(conn, recipe_id),
+                "cycles": evidence["cycles"],
+                "missing": evidence["missing"],
+            },
+        )
+
+    # 分析通过：同一事务内翻转状态（触发器只允许改 status/published_at）
+    crud.set_recipe_status(conn, recipe_id, publishing.STATUS_PUBLISHED)
+    result = _publish_status_out(conn, recipe_id)
+    result["validation"] = {
+        "direct_allergens": analysis["direct_allergens"],
+        "total_allergens": analysis["total_allergens"],
+        "cycles": 0,
+        "missing_nodes": [],
+    }
+    return result
+
+
+@app.post("/api/recipes/{recipe_id}/unpublish")
+def unpublish_recipe(recipe_id: int, conn=Depends(conn_dep)):
+    """撤回发布：版本恢复为草稿，配方/原料/替代关系写接口不再拒绝其相关修改。"""
+    row = crud.get_recipe(conn, recipe_id)
+    if row is None:
+        raise HTTPException(404, "配方不存在")
+    if row["status"] == publishing.STATUS_DRAFT:
+        raise HTTPException(409, f"配方 {row['code']} 版本 {row['version']} 尚为草稿，无需撤回")
+    crud.set_recipe_status(conn, recipe_id, publishing.STATUS_DRAFT)
+    return _publish_status_out(conn, recipe_id)
 
 
 def _validate_items(conn, data: RecipeIn):
@@ -531,6 +612,7 @@ def import_data(payload: dict, mode: str = "merge", conn=Depends(conn_dep)):
     if mode == "replace":
         # 逐个删除配方以保留每条删除审计事件；审计表自身的触发器会拒绝清空，
         # 因此不能使用 DROP/DELETE FROM recipe_audit_events 之类的脚本。
+        # 已发布版本锁定同样在此生效：触及已发布版本将整体回滚（409）。
         for r in crud.list_recipes(conn):
             crud.delete_recipe(conn, r["id"])
         conn.executescript("DELETE FROM substitutions; DELETE FROM ingredients;")

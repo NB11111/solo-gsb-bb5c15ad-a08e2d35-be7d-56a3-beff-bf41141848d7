@@ -1,8 +1,13 @@
-"""原料、配方、替代关系的数据库读写操作。"""
+"""原料、配方、替代关系的数据库读写操作。
+
+已发布版本的写保护统一在本层强制（路由层与 /api/import 等批量接口都经过
+这里），任何触及锁定版本的修改抛出 publishing.PublishedLockError（409），
+并随调用方事务整体回滚。
+"""
 import sqlite3
 from typing import List
 
-from . import audit
+from . import audit, publishing
 from .schemas import (
     IngredientIn,
     RecipeIn,
@@ -29,6 +34,14 @@ def upsert_ingredient(conn: sqlite3.Connection, data: IngredientIn, code: str | 
     allergens = ",".join(normalize_allergens(data.allergens))
     existing = get_ingredient(conn, target_code)
     if existing:
+        # 改代码（图结构）/过敏原（分析结果）受发布锁保护；改名/备注不拦截
+        publishing.assert_ingredient_change(
+            conn,
+            old_code=target_code,
+            new_code=data.code,
+            old_allergens=[a.strip() for a in existing["allergens"].split(",") if a.strip()],
+            new_allergens=normalize_allergens(data.allergens),
+        )
         conn.execute(
             "UPDATE ingredients SET code=?, name=?, allergens=?, note=? WHERE id=?",
             (data.code, data.name, allergens, data.note, existing["id"]),
@@ -42,6 +55,8 @@ def upsert_ingredient(conn: sqlite3.Connection, data: IngredientIn, code: str | 
 
 
 def delete_ingredient(conn: sqlite3.Connection, code: str) -> bool:
+    # 删除原料会让引用它的已发布版本出现缺失节点并级联清边：锁定版本拒绝
+    publishing.assert_ingredient_deletable(conn, code)
     cur = conn.execute("DELETE FROM ingredients WHERE code = ?", (code,))
     return cur.rowcount > 0
 
@@ -85,6 +100,8 @@ def upsert_recipe(conn: sqlite3.Connection, data: RecipeIn, recipe_id: int | Non
         existing = find_recipe(conn, data.code, data.version)
 
     if existing:
+        # 已发布版本锁定：PUT 修改整体拒绝（发布/撤回走专用接口）
+        publishing.assert_recipe_writable(conn, existing)
         rid = existing["id"]
         before = audit.snapshot_recipe(conn, rid)
         conn.execute(
@@ -118,6 +135,11 @@ def upsert_recipe(conn: sqlite3.Connection, data: RecipeIn, recipe_id: int | Non
 
 def delete_recipe(conn: sqlite3.Connection, recipe_id: int) -> bool:
     """删除配方，并在同一事务内（删除前快照）追加审计事件。"""
+    existing = get_recipe(conn, recipe_id)
+    if existing is None:
+        return False
+    # 已发布版本锁定：DELETE 拒绝
+    publishing.assert_recipe_writable(conn, existing)
     before = audit.snapshot_recipe(conn, recipe_id)
     if before is None:
         return False
@@ -126,6 +148,38 @@ def delete_recipe(conn: sqlite3.Connection, recipe_id: int) -> bool:
     audit.record_event(
         conn, recipe_id=recipe_id, recipe_code=before["code"], version=before["version"],
         action="deleted", before=before, after=None,
+    )
+    return True
+
+
+def set_recipe_status(conn: sqlite3.Connection, recipe_id: int, status: str) -> bool:
+    """在调用方事务内翻转配方版本的发布状态，并追加审计事件。
+
+    status 为 publishing.STATUS_PUBLISHED / STATUS_DRAFT。
+    配方不存在返回 False；状态未变化返回 True 但不写事件（幂等由路由层把关）。
+    """
+    existing = get_recipe(conn, recipe_id)
+    if existing is None:
+        return False
+    if existing["status"] == status:
+        return True
+    before = audit.snapshot_recipe(conn, recipe_id)
+    if status == publishing.STATUS_PUBLISHED:
+        conn.execute(
+            "UPDATE recipes SET status = 'published', published_at = datetime('now') WHERE id = ?",
+            (recipe_id,),
+        )
+        action = "published"
+    else:
+        conn.execute(
+            "UPDATE recipes SET status = 'draft', published_at = NULL WHERE id = ?",
+            (recipe_id,),
+        )
+        action = "unpublished"
+    after = audit.snapshot_recipe(conn, recipe_id)
+    audit.record_event(
+        conn, recipe_id=recipe_id, recipe_code=after["code"], version=after["version"],
+        action=action, before=before, after=after,
     )
     return True
 
@@ -149,6 +203,7 @@ def get_substitution(conn: sqlite3.Connection, sub_id: int):
 
 
 def create_substitution(conn: sqlite3.Connection, data: SubstitutionIn):
+    publishing.assert_substitution_add(conn, data.source_code, data.target_code)
     cur = conn.execute(
         "INSERT INTO substitutions (source_code, target_code, note) VALUES (?, ?, ?)",
         (data.source_code, data.target_code, data.note),
@@ -157,6 +212,16 @@ def create_substitution(conn: sqlite3.Connection, data: SubstitutionIn):
 
 
 def update_substitution(conn: sqlite3.Connection, sub_id: int, data: SubstitutionIn) -> bool:
+    existing = get_substitution(conn, sub_id)
+    if existing is None:
+        return False
+    publishing.assert_substitution_update(
+        conn,
+        old_source_code=existing["source_code"],
+        old_target_code=existing["target_code"],
+        new_source_code=data.source_code,
+        new_target_code=data.target_code,
+    )
     cur = conn.execute(
         "UPDATE substitutions SET source_code=?, target_code=?, note=? WHERE id=?",
         (data.source_code, data.target_code, data.note, sub_id),
@@ -165,6 +230,12 @@ def update_substitution(conn: sqlite3.Connection, sub_id: int, data: Substitutio
 
 
 def delete_substitution(conn: sqlite3.Connection, sub_id: int) -> bool:
+    existing = get_substitution(conn, sub_id)
+    if existing is None:
+        return False
+    publishing.assert_substitution_delete(
+        conn, existing["source_code"], existing["target_code"]
+    )
     cur = conn.execute("DELETE FROM substitutions WHERE id = ?", (sub_id,))
     return cur.rowcount > 0
 

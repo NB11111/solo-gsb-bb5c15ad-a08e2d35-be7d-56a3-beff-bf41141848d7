@@ -13,8 +13,14 @@ import sqlite3
 from datetime import datetime
 from typing import List, Optional
 
-ACTIONS = ("created", "updated", "deleted")
-ACTION_LABELS = {"created": "创建", "updated": "修改", "deleted": "删除"}
+ACTIONS = ("created", "updated", "deleted", "published", "unpublished")
+ACTION_LABELS = {
+    "created": "创建",
+    "updated": "修改",
+    "deleted": "删除",
+    "published": "发布",
+    "unpublished": "撤回发布",
+}
 
 
 # ---------------- 快照 ----------------
@@ -52,6 +58,8 @@ def snapshot_recipe(conn: sqlite3.Connection, recipe_id: int) -> Optional[dict]:
         "name": row["name"],
         "note": row["note"],
         "created_at": row["created_at"],
+        "status": row["status"],
+        "published_at": row["published_at"],
         "items": _snapshot_items(conn, recipe_id),
     }
 
@@ -124,6 +132,9 @@ def diff_snapshots(before: Optional[dict], after: Optional[dict]) -> dict:
         action = "created"
     elif before is not None and after is None:
         action = "deleted"
+    elif before is not None and after is not None and before.get("status") != after.get("status"):
+        # 发布 / 撤回发布：仅状态翻转，配料与配方元数据不变
+        action = "published" if after.get("status") == "published" else "unpublished"
     else:
         action = "updated"
 
@@ -166,6 +177,15 @@ def diff_snapshots(before: Optional[dict], after: Optional[dict]) -> dict:
                  f"原有 {len(before.get('items', []))} 种配料")
         for it in removed:
             add_line("removed", f"移除配料 {_item_brief(it)}，原用量 {_fmt_measure(it['quantity'], it['unit'])}")
+    elif action in ("published", "unpublished"):
+        if action == "published":
+            add_line("published",
+                     f"发布配方 {after.get('code')} v{after.get('version')}（{after.get('name')}），"
+                     f"版本锁定为已发布（配料、原料与替代关系修改将被拒绝，直至撤回发布）")
+        else:
+            add_line("unpublished",
+                     f"撤回发布配方 {after.get('code')} v{after.get('version')}（{after.get('name')}），"
+                     f"版本恢复为草稿，可继续修改")
     else:
         add_line("updated",
                  f"修改配方 {before.get('code')} v{before.get('version')}（{before.get('name')}）")

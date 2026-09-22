@@ -13,11 +13,13 @@ async function api(path, options = {}) {
   const text = await res.text();
   const data = text ? JSON.parse(text) : null;
   if (!res.ok) {
-    const err = new Error(
-      data && data.detail
-        ? (typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail))
-        : `HTTP ${res.status}`
-    );
+    let message = `HTTP ${res.status}`;
+    if (data && data.detail) {
+      if (typeof data.detail === "string") message = data.detail;
+      else if (typeof data.detail.message === "string") message = data.detail.message;
+      else message = JSON.stringify(data.detail);
+    }
+    const err = new Error(message);
     err.status = res.status;
     err.payload = data;
     throw err;
@@ -121,7 +123,7 @@ $("#form-ingredient").addEventListener("submit", async (e) => {
     $("#form-ingredient").classList.add("hidden");
     await refreshAll();
   } catch (err) {
-    toast(err.message, true);
+    if (!showLockAndJump(err)) toast(err.message, true);
   }
 });
 
@@ -145,7 +147,7 @@ $("#tbody-ingredients").addEventListener("click", async (e) => {
       toast("已删除");
       await refreshAll();
     } catch (err) {
-      toast(err.message, true);
+      if (!showLockAndJump(err)) toast(err.message, true);
     }
   }
 });
@@ -199,7 +201,7 @@ $("#form-substitution").addEventListener("submit", async (e) => {
     $("#sub-note").value = "";
     await loadSubstitutions();
   } catch (err) {
-    toast(err.message, true);
+    if (!showLockAndJump(err)) toast(err.message, true);
   }
 });
 
@@ -212,7 +214,7 @@ $("#tbody-substitutions").addEventListener("click", async (e) => {
     toast("已删除");
     await loadSubstitutions();
   } catch (err) {
-    toast(err.message, true);
+    if (!showLockAndJump(err)) toast(err.message, true);
   }
 });
 
@@ -222,21 +224,30 @@ async function loadRecipes() {
   state.recipes = await api("/api/recipes");
   const tbody = $("#tbody-recipes");
   if (!state.recipes.length) {
-    tbody.innerHTML = '<tr><td colspan="6" class="empty">暂无配方版本</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" class="empty">暂无配方版本</td></tr>';
     return;
   }
-  tbody.innerHTML = state.recipes.map((r) => `
-    <tr>
+  tbody.innerHTML = state.recipes.map((r) => {
+    const published = r.status === "published";
+    const statusCell = published
+      ? `<span class="tag status-published" title="发布于 ${esc(r.published_at || "")} UTC">🔒 已发布</span><br><small class="muted-time">${esc(r.published_at || "")}</small>`
+      : '<span class="tag status-draft">📝 草稿</span>';
+    const actions = published
+      ? `<button class="btn tiny primary" data-act="unpublish-rec" data-id="${r.id}">撤回发布</button>`
+      : `<button class="btn tiny" data-act="edit-rec" data-id="${r.id}">编辑</button>
+         <button class="btn tiny primary" data-act="publish-rec" data-id="${r.id}">🔒 发布</button>
+         <button class="btn tiny danger" data-act="del-rec" data-id="${r.id}">删除</button>`;
+    return `
+    <tr class="${published ? "row-published" : ""}">
       <td class="code-mono">${esc(r.code)}</td>
       <td>${esc(r.version)}</td>
       <td>${esc(r.name)}</td>
+      <td>${statusCell}</td>
       <td>${r.item_count}</td>
       <td><small>${esc(r.created_at)}</small></td>
-      <td>
-        <button class="btn tiny" data-act="edit-rec" data-id="${r.id}">编辑</button>
-        <button class="btn tiny danger" data-act="del-rec" data-id="${r.id}">删除</button>
-      </td>
-    </tr>`).join("");
+      <td>${actions}</td>
+    </tr>`;
+  }).join("");
 }
 
 function itemRowHtml(item = { ingredient_code: "", quantity: "", unit: "" }) {
@@ -301,15 +312,149 @@ $("#form-recipe").addEventListener("submit", async (e) => {
     await loadRecipes();
     fillRecipeSelects();
   } catch (err) {
+    if (err.status === 409 && err.payload && err.payload.detail &&
+        err.payload.detail.locked_versions) {
+      renderLockEvidence(err.payload.detail);
+    }
     toast(err.message, true);
   }
+});
+
+function renderPublishEvidence(recipe, detail) {
+  /* 发布被后端拒绝（循环 / 缺失节点）：在配方页顶部展示带路径的错误证据。 */
+  const cycles = detail.cycles || [];
+  const missing = detail.missing || [];
+  let html = `<div class="alert cycle publish-evidence" id="publish-evidence-box">
+    <div class="evidence-head">
+      <strong>🚫 无法发布 ${esc(recipe.code)} v${esc(recipe.version)}（${esc(recipe.name)}）</strong>
+      <button type="button" class="btn tiny" id="btn-close-publish-evidence">关闭</button>
+    </div>
+    <div class="evidence-message">${esc(detail.message || "替代图分析未通过")}</div>`;
+
+  if (cycles.length) {
+    html += `<div class="evidence-section"><strong>检测到 ${cycles.length} 条循环替代路径：</strong><ul>`;
+    html += cycles.map((c) =>
+      `<li>路径 #${c.path_id}（起点 <span class="code-mono">${esc(c.root)}</span>）在 ` +
+      `<span class="code-mono">${esc(c.cycle_node)}</span> 处成环：` +
+      `<span class="ev-chain cyclic">${c.nodes.map((n, i) =>
+        `<span class="path-node ${i === c.nodes.length - 1 ? "repeat" : ""}">${esc(n)}</span>`
+      ).join('<span class="path-edge"> → </span>')}</span></li>`
+    ).join("");
+    html += `</ul></div>`;
+  }
+
+  if (missing.length) {
+    html += `<div class="evidence-section"><strong>存在 ${missing.length} 个缺失原料节点：</strong><ul>`;
+    html += missing.map((m) =>
+      `<li><span class="path-node repeat">${esc(m.code)}</span> 缺失` +
+      (m.nodes && m.nodes.length
+        ? `，出现路径（#${m.path_id}，起点 <span class="code-mono">${esc(m.root)}</span>）：` +
+          `<span class="ev-chain missing">${m.nodes.map((n) =>
+            `<span class="path-node ${n === m.code ? "repeat" : ""}">${esc(n)}</span>`
+          ).join('<span class="path-edge"> → </span>')}</span>`
+        : "") +
+      `；请在原料库补录后重试发布。</li>`
+    ).join("");
+    html += `</ul></div>`;
+  }
+  html += `</div>`;
+  $("#publish-feedback").innerHTML = html;
+  $("#publish-feedback").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function renderLockEvidence(detail) {
+  /* 409 锁定：指出被哪些已发布版本锁定，以及对象经由哪条路径影响它们。 */
+  const versions = (detail && detail.locked_versions) || [];
+  let html = `<div class="alert warn publish-evidence" id="publish-evidence-box">
+    <div class="evidence-head">
+      <strong>🔒 修改被已发布版本锁定</strong>
+      <button type="button" class="btn tiny" id="btn-close-publish-evidence">关闭</button>
+    </div>
+    <div class="evidence-message">${esc((detail && detail.message) || "该修改会影响已发布版本")}</div>`;
+  if (versions.length) {
+    html += `<ul>${versions.map((v) => {
+      let path = "";
+      if (v.via_path && v.via_path.length) {
+        path = v.via_direct
+          ? `<div class="muted-time">该原料是此版本的直接配料。</div>`
+          : `<div class="muted-time">影响路径：<span class="ev-chain">${
+              v.via_path.map((n) => `<span class="path-node">${esc(n)}</span>`)
+                .join('<span class="path-edge"> → </span>')
+            }</span></div>`;
+      }
+      return `<li><span class="tag status-published">🔒 ${esc(v.code)} v${esc(v.version)}</span>
+        <small>（id=${v.id}，发布于 ${esc(v.published_at || "")} UTC）</small>${path}</li>`;
+    }).join("")}</ul>`;
+  }
+  html += `</div>`;
+  $("#publish-feedback").innerHTML = html;
+  $("#publish-feedback").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function clearPublishEvidence() {
+  $("#publish-feedback").innerHTML = "";
+}
+
+function showLockAndJump(err) {
+  /* 原料/替代关系页遇到 409 锁定：切到配方版本页展示锁定证据。 */
+  if (err.status === 409 && err.payload && err.payload.detail &&
+      err.payload.detail.locked_versions) {
+    document.querySelector('.tab[data-tab="recipes"]').click();
+    renderLockEvidence(err.payload.detail);
+    return true;
+  }
+  return false;
+}
+
+$("#publish-feedback").addEventListener("click", (e) => {
+  if (e.target.closest("#btn-close-publish-evidence")) clearPublishEvidence();
 });
 
 $("#tbody-recipes").addEventListener("click", async (e) => {
   const btn = e.target.closest("button");
   if (!btn) return;
   const id = btn.dataset.id;
-  if (btn.dataset.act === "edit-rec") {
+  const act = btn.dataset.act;
+
+  if (act === "publish-rec") {
+    clearPublishEvidence();
+    btn.disabled = true;
+    try {
+      const data = await api(`/api/recipes/${id}/publish`, { method: "POST" });
+      toast(`已发布 ${data.code} v${data.version}（版本已锁定）`);
+      await loadRecipes();
+      fillRecipeSelects();
+    } catch (err) {
+      const rec = state.recipes.find((x) => String(x.id) === String(id));
+      if (err.status === 422 && err.payload && err.payload.detail &&
+          (err.payload.detail.cycles || err.payload.detail.missing)) {
+        renderPublishEvidence(rec || { code: "", version: "", name: "" }, err.payload.detail);
+      } else if (err.status === 409 && err.payload && err.payload.detail &&
+                 err.payload.detail.locked_versions) {
+        renderLockEvidence(err.payload.detail);
+      }
+      toast(err.message, true);
+    } finally {
+      btn.disabled = false;
+    }
+    return;
+  }
+
+  if (act === "unpublish-rec") {
+    if (!confirm("撤回发布后，该版本恢复为草稿，配方、原料与替代关系可再次修改。确定撤回？")) return;
+    clearPublishEvidence();
+    try {
+      const data = await api(`/api/recipes/${id}/unpublish`, { method: "POST" });
+      toast(`已撤回 ${data.code} v${data.version} 的发布，恢复为草稿`);
+      await loadRecipes();
+      fillRecipeSelects();
+    } catch (err) {
+      toast(err.message, true);
+    }
+    return;
+  }
+
+  if (act === "edit-rec") {
     const rec = await api(`/api/recipes/${id}`);
     $("#form-recipe").classList.remove("hidden");
     $("#rec-id").value = rec.id;
@@ -321,7 +466,7 @@ $("#tbody-recipes").addEventListener("click", async (e) => {
       ? rec.items.map((it) => itemRowHtml(it)).join("")
       : itemRowHtml();
     $("#form-recipe").scrollIntoView({ behavior: "smooth" });
-  } else if (btn.dataset.act === "del-rec") {
+  } else if (act === "del-rec") {
     if (!confirm("确定删除该配方版本？")) return;
     try {
       await api(`/api/recipes/${id}`, { method: "DELETE" });
@@ -329,6 +474,10 @@ $("#tbody-recipes").addEventListener("click", async (e) => {
       await loadRecipes();
       fillRecipeSelects();
     } catch (err) {
+      if (err.status === 409 && err.payload && err.payload.detail &&
+          err.payload.detail.locked_versions) {
+        renderLockEvidence(err.payload.detail);
+      }
       toast(err.message, true);
     }
   }
@@ -1186,6 +1335,8 @@ const AUDIT_BADGE = {
   created: ['tag ok', '创建'],
   updated: ['tag new', '修改'],
   deleted: ['tag danger', '删除'],
+  published: ['tag status-published', '发布'],
+  unpublished: ['tag status-draft', '撤回发布'],
 };
 const AUDIT_LINE_STYLE = {
   created: "audit-line-created",
@@ -1193,6 +1344,8 @@ const AUDIT_LINE_STYLE = {
   removed: "audit-line-removed",
   changed: "audit-line-changed",
   deleted: "audit-line-deleted",
+  published: "audit-line-published",
+  unpublished: "audit-line-unpublished",
   meta: "audit-line-meta",
   noop: "audit-line-noop",
 };
