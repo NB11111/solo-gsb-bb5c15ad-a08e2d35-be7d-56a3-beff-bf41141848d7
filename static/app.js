@@ -222,21 +222,60 @@ async function loadRecipes() {
   state.recipes = await api("/api/recipes");
   const tbody = $("#tbody-recipes");
   if (!state.recipes.length) {
-    tbody.innerHTML = '<tr><td colspan="6" class="empty">暂无配方版本</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" class="empty">暂无配方版本</td></tr>';
     return;
   }
-  tbody.innerHTML = state.recipes.map((r) => `
-    <tr>
+  tbody.innerHTML = state.recipes.map((r) => {
+    const published = r.status === "published";
+    const statusBadge = published
+      ? `<span class="tag status-published" title="发布于 ${esc(r.published_at || "")} UTC">🔒 已发布</span><br><small>${esc(r.published_at || "")}</small>`
+      : '<span class="tag status-draft">📝 草稿</span>';
+    const actions = published
+      ? `<button class="btn tiny" data-act="analyze-rec" data-id="${r.id}">分析</button>
+         <button class="btn tiny warn" data-act="unpublish-rec" data-id="${r.id}">撤回发布</button>`
+      : `<button class="btn tiny" data-act="publish-rec" data-id="${r.id}">发布</button>
+         <button class="btn tiny" data-act="edit-rec" data-id="${r.id}">编辑</button>
+         <button class="btn tiny danger" data-act="del-rec" data-id="${r.id}">删除</button>`;
+    return `
+    <tr class="${published ? "row-published" : ""}">
       <td class="code-mono">${esc(r.code)}</td>
       <td>${esc(r.version)}</td>
       <td>${esc(r.name)}</td>
+      <td>${statusBadge}</td>
       <td>${r.item_count}</td>
       <td><small>${esc(r.created_at)}</small></td>
-      <td>
-        <button class="btn tiny" data-act="edit-rec" data-id="${r.id}">编辑</button>
-        <button class="btn tiny danger" data-act="del-rec" data-id="${r.id}">删除</button>
-      </td>
-    </tr>`).join("");
+      <td>${actions}</td>
+    </tr>`;
+  }).join("");
+}
+
+function renderPublishBlock(detail) {
+  const d = detail || {};
+  let html = `<div class="alert cycle" id="publish-block-box">
+    <strong>⚠ ${esc(d.message || "发布被拒绝：替代图分析未通过")}</strong>`;
+  const cycles = d.cycles || [];
+  if (cycles.length) {
+    html += `<div style="margin-top:8px"><strong>循环路径（${cycles.length} 条）：</strong><ul>`;
+    html += cycles.map((c) =>
+      `<li>路径 #${c.path_id}（起点 <span class="code-mono">${esc(c.root)}</span>）在 <span class="code-mono">${esc(c.cycle_node)}</span> 处成环：${c.nodes.map(esc).join(" → ")}</li>`
+    ).join("");
+    html += `</ul></div>`;
+  }
+  if (d.missing_nodes && d.missing_nodes.length) {
+    html += `<div style="margin-top:8px"><strong>缺失原料节点：</strong>${d.missing_nodes.map(esc).join("、")}</div>`;
+  }
+  const missingPaths = d.missing_paths || [];
+  if (missingPaths.length) {
+    const shown = missingPaths.slice(0, 20);
+    html += `<details style="margin-top:8px"><summary>缺失节点所在路径（${missingPaths.length} 条${missingPaths.length > shown.length ? `，展示前 ${shown.length} 条` : ""}）</summary><div class="path-list" style="margin-top:6px">`;
+    html += shown.map((p) =>
+      `<div class="path-line missing">起点 <span class="code-mono">${esc(p.root)}</span>：${p.nodes.map(esc).join(" → ")}</div>`
+    ).join("");
+    html += `</div></details>`;
+  }
+  html += `</div>`;
+  $("#publish-result").innerHTML = html;
+  $("#publish-result").scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
 function itemRowHtml(item = { ingredient_code: "", quantity: "", unit: "" }) {
@@ -309,7 +348,47 @@ $("#tbody-recipes").addEventListener("click", async (e) => {
   const btn = e.target.closest("button");
   if (!btn) return;
   const id = btn.dataset.id;
-  if (btn.dataset.act === "edit-rec") {
+  const act = btn.dataset.act;
+  if (act === "publish-rec") {
+    btn.disabled = true;
+    $("#publish-result").innerHTML = '<div class="card hint">正在后端重新执行替代图分析…</div>';
+    try {
+      const rec = await api(`/api/recipes/${id}/publish`, { method: "POST" });
+      $("#publish-result").innerHTML = "";
+      toast(`已发布：${rec.code} v${rec.version}（${rec.published_at} UTC），版本已锁定`);
+      await loadRecipes();
+      fillRecipeSelects();
+    } catch (err) {
+      if (err.status === 422 && err.payload && err.payload.detail
+          && err.payload.detail.error_code === "publish_graph_invalid") {
+        renderPublishBlock(err.payload.detail);
+        toast(err.payload.detail.message, true);
+      } else {
+        $("#publish-result").innerHTML = "";
+        toast(err.message, true);
+      }
+    } finally {
+      btn.disabled = false;
+    }
+  } else if (act === "unpublish-rec") {
+    if (!confirm("撤回发布后该版本将回到草稿状态，配方、原料与替代关系的锁定都会解除，确定撤回？")) return;
+    try {
+      await api(`/api/recipes/${id}/unpublish`, { method: "POST" });
+      $("#publish-result").innerHTML = "";
+      toast("已撤回发布，版本回到草稿");
+      await loadRecipes();
+      fillRecipeSelects();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  } else if (act === "analyze-rec") {
+    $$("#tabs .tab").forEach((b) => b.classList.remove("active"));
+    $$(".panel").forEach((p) => p.classList.remove("active"));
+    $('[data-tab="analysis"]').classList.add("active");
+    $("#tab-analysis").classList.add("active");
+    $("#analyze-recipe").value = id;
+    $("#btn-analyze").click();
+  } else if (act === "edit-rec") {
     const rec = await api(`/api/recipes/${id}`);
     $("#form-recipe").classList.remove("hidden");
     $("#rec-id").value = rec.id;
@@ -321,7 +400,7 @@ $("#tbody-recipes").addEventListener("click", async (e) => {
       ? rec.items.map((it) => itemRowHtml(it)).join("")
       : itemRowHtml();
     $("#form-recipe").scrollIntoView({ behavior: "smooth" });
-  } else if (btn.dataset.act === "del-rec") {
+  } else if (act === "del-rec") {
     if (!confirm("确定删除该配方版本？")) return;
     try {
       await api(`/api/recipes/${id}`, { method: "DELETE" });
@@ -343,7 +422,7 @@ function recipeOptions(selectEl, includeAllVersions = true) {
   });
   selectEl.innerHTML = Object.entries(groups).map(([code, rs]) => `
     <optgroup label="${esc(code)}">
-      ${rs.map((r) => `<option value="${r.id}">v${esc(r.version)} · ${esc(r.name)}</option>`).join("")}
+      ${rs.map((r) => `<option value="${r.id}">${r.status === "published" ? "🔒 " : ""}v${esc(r.version)} · ${esc(r.name)}</option>`).join("")}
     </optgroup>`).join("");
 }
 

@@ -21,6 +21,9 @@ CREATE TABLE IF NOT EXISTS recipes (
     name            TEXT NOT NULL,
     note            TEXT NOT NULL DEFAULT '',
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    status          TEXT NOT NULL DEFAULT 'draft'
+                    CHECK (status IN ('draft', 'published')),   -- 草稿 / 已发布（发布锁）
+    published_at    TEXT,                                       -- 最近一次发布时间（撤回后清空）
     UNIQUE(code, version)
 );
 
@@ -86,3 +89,11 @@ def get_connection() -> sqlite3.Connection:
 def init_db() -> None:
     with get_connection() as conn:
         conn.executescript(SCHEMA)
+        # 平滑升级旧库：为已有的 recipes 表补充发布锁列（新建库已由建表语句包含）
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(recipes)").fetchall()}
+        if "status" not in cols:
+            conn.execute(
+                "ALTER TABLE recipes ADD COLUMN status TEXT NOT NULL DEFAULT 'draft'"
+            )
+        if "published_at" not in cols:
+            conn.execute("ALTER TABLE recipes ADD COLUMN published_at TEXT")

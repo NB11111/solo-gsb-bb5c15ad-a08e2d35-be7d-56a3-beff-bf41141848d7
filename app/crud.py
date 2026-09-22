@@ -3,6 +3,7 @@ import sqlite3
 from typing import List
 
 from . import audit
+from .locks import PublishedLockError
 from .schemas import (
     IngredientIn,
     RecipeIn,
@@ -67,6 +68,20 @@ def find_recipe(conn: sqlite3.Connection, code: str, version: str):
     ).fetchone()
 
 
+def set_recipe_status(conn: sqlite3.Connection, recipe_id: int, status: str):
+    """发布 / 撤回发布：更新 status 与 published_at（不提交，由调用方事务统一提交）。"""
+    if status == "published":
+        conn.execute(
+            "UPDATE recipes SET status = 'published', published_at = datetime('now') WHERE id = ?",
+            (recipe_id,),
+        )
+    else:
+        conn.execute(
+            "UPDATE recipes SET status = 'draft', published_at = NULL WHERE id = ?",
+            (recipe_id,),
+        )
+
+
 def _replace_items(conn: sqlite3.Connection, recipe_id: int, items: List[RecipeItemIn]) -> None:
     conn.execute("DELETE FROM recipe_items WHERE recipe_id = ?", (recipe_id,))
     for it in items:
@@ -86,6 +101,14 @@ def upsert_recipe(conn: sqlite3.Connection, data: RecipeIn, recipe_id: int | Non
 
     if existing:
         rid = existing["id"]
+        # 已发布版本整体锁定：任何编辑（含代码/版本号/名称/配料表）都拒绝
+        if existing["status"] == "published":
+            raise PublishedLockError(
+                f"配方 {existing['code']} v{existing['version']}（id={rid}）已发布并锁定，"
+                f"禁止修改；请先调用 POST /api/recipes/{rid}/unpublish 撤回发布。",
+                locked_recipe={"id": rid, "code": existing["code"],
+                               "version": existing["version"], "name": existing["name"]},
+            )
         before = audit.snapshot_recipe(conn, rid)
         conn.execute(
             "UPDATE recipes SET code=?, version=?, name=?, note=? WHERE id=?",
@@ -121,6 +144,19 @@ def delete_recipe(conn: sqlite3.Connection, recipe_id: int) -> bool:
     before = audit.snapshot_recipe(conn, recipe_id)
     if before is None:
         return False
+    locked = conn.execute(
+        "SELECT status FROM recipes WHERE id = ?", (recipe_id,)
+    ).fetchone()
+    if locked is not None and locked["status"] == "published":
+        row = conn.execute(
+            "SELECT code, version, name FROM recipes WHERE id = ?", (recipe_id,)
+        ).fetchone()
+        raise PublishedLockError(
+            f"配方 {row['code']} v{row['version']}（id={recipe_id}）已发布并锁定，"
+            f"禁止删除；请先调用 POST /api/recipes/{recipe_id}/unpublish 撤回发布。",
+            locked_recipe={"id": recipe_id, "code": row["code"],
+                           "version": row["version"], "name": row["name"]},
+        )
     conn.execute("DELETE FROM recipe_items WHERE recipe_id = ?", (recipe_id,))
     conn.execute("DELETE FROM recipes WHERE id = ?", (recipe_id,))
     audit.record_event(

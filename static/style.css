@@ -114,7 +114,17 @@ input:focus, select:focus, textarea:focus { outline: 2px solid #bfe0cd; border-c
 .btn.primary:hover { background: var(--primary-dark); }
 .btn.danger { color: var(--danger); }
 .btn.danger:hover { border-color: var(--danger); background: var(--danger-bg); }
+.btn.warn { color: var(--warn); }
+.btn.warn:hover { border-color: var(--warn); background: var(--warn-bg); }
 .btn.tiny { padding: 3px 9px; font-size: 12px; }
+
+/* 配方版本发布锁 */
+.tag.status-published { background: #e7f3ec; border-color: #aed9c0; color: var(--primary-dark); white-space: nowrap; }
+.tag.status-draft { background: #eef0ef; border-color: #d6dad8; color: var(--muted); white-space: nowrap; }
+.row-published { background: #f6faf8; }
+.row-published td:first-child { border-left: 3px solid var(--primary); }
+#publish-hint { margin: 8px 0 12px; }
+#publish-result .path-line.missing { margin-bottom: 4px; }
 
 .data-table {
   width: 100%;

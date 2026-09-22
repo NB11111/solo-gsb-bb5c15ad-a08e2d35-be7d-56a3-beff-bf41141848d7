@@ -1,5 +1,6 @@
 """内置示例数据：一条黄油 <-> 人造黄油循环，三版曲奇配方（含过敏原回归/回归消失场景）。"""
 from . import crud
+from .locks import find_locked_recipes
 from .schemas import IngredientIn, RecipeIn, RecipeItemIn, SubstitutionIn
 
 INGREDIENTS = [
@@ -72,6 +73,34 @@ RECIPES = [
 
 
 def seed(conn) -> dict:
+    # 发布锁预检：示例数据会覆盖固定代码的原料/替代边以及 COOKIE-001 的三个版本。
+    # 仅当存在“依赖会被覆盖的原料/替代边”或“本身会被覆盖的已发布版本”时，
+    # 在任何写入之前整体拒绝，避免部分写入；无关的已发布版本不影响载入示例。
+    locked = find_locked_recipes(
+        conn,
+        ingredient_codes=[i.code for i in INGREDIENTS],
+        edge_source_codes=[s.source_code for s in SUBSTITUTIONS],
+    )
+    seed_keys = {(rec.code, rec.version) for rec in RECIPES}
+    locked += [
+        r
+        for r in crud.list_recipes(conn)
+        if r["status"] == "published" and (r["code"], r["version"]) in seed_keys
+    ]
+    # 去重（同一已发布版本可能同时命中原料与配方预检）
+    seen: set = set()
+    locked = [r for r in locked if not (r["id"] in seen or seen.add(r["id"]))]
+    if locked:
+        from fastapi import HTTPException
+
+        raise HTTPException(
+            409,
+            "存在已发布（锁定）的配方版本，载入示例数据会覆盖其依赖的原料 / 替代边 / 配方，已拒绝；"
+            "锁定版本：" + "；".join(
+                f"配方 {r['code']} v{r['version']}（id={r['id']}）" for r in locked
+            ) + "。请先调用对应版本的 /unpublish 撤回发布。",
+        )
+
     counts = {"ingredients": 0, "recipes": 0, "substitutions": 0}
     for ing in INGREDIENTS:
         crud.upsert_ingredient(conn, ing)

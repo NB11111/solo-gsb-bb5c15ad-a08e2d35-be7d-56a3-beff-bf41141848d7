@@ -73,10 +73,12 @@
       <h2>配方版本</h2>
       <button class="btn primary" id="btn-new-recipe">＋ 新增配方版本</button>
     </div>
+    <p class="hint" id="publish-hint">版本初始为<strong>草稿</strong>状态，可随时编辑；发布时后端会在同一事务内重新执行替代图分析，确认无循环、无缺失节点后才置为<strong>已发布</strong>并加锁。已发布版本及其依赖的原料、替代关系均不可修改，需先撤回发布。</p>
     <table class="data-table">
-      <thead><tr><th>配方代码</th><th>版本</th><th>名称</th><th>原料数</th><th>创建时间</th><th>操作</th></tr></thead>
+      <thead><tr><th>配方代码</th><th>版本</th><th>名称</th><th>状态</th><th>原料数</th><th>创建时间</th><th>操作</th></tr></thead>
       <tbody id="tbody-recipes"></tbody>
     </table>
+    <div id="publish-result"></div>
 
     <form id="form-recipe" class="card hidden">
       <div class="form-grid">
